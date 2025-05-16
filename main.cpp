@@ -9,6 +9,7 @@
 #include <fstream>
 #include <unordered_set>
 #include <unordered_map>
+#include <omp.h>
 
 using namespace std;
 
@@ -107,60 +108,109 @@ void trainModel(
     for (int epoch = 0; epoch < numEpochs; epoch++)
     {
         double totalLoss = 0.0;
-        for (size_t i = 0; i < words.size(); ++i)
+
+        // Prepare global gradients
+        vector<vector<double>> contextMatrixGrad(contextMatrix.size(), vector<double>(contextMatrix[0].size(), 0.0));
+        vector<vector<double>> embeddingMatrixGrad(embeddingMatrix.size(), vector<double>(embeddingMatrix[0].size(), 0.0));
+
+        int nThreads = 1;
+        #pragma omp parallel
         {
-            vector<double> oneHot(vocabulary.size(), 0.0);
-            auto it = wordToIndex.find(words[i]);
-            if (it == wordToIndex.end())
-                continue;
-            size_t currentWordIndex = it->second;
-            oneHot[currentWordIndex] = 1.0;
+            #pragma omp single
+            nThreads = omp_get_num_threads();
+        }
 
-            // Forward pass
-            vector<double> embeddingResult(embeddingMatrix[0].size(), 0.0);
-            for (size_t k = 0; k < embeddingMatrix[0].size(); ++k)
-                for (size_t l = 0; l < vocabulary.size(); ++l)
-                    embeddingResult[k] += oneHot[l] * embeddingMatrix[l][k];
+        // Thread-local gradient buffers
+        vector<vector<vector<double>>> threadContextGrads(nThreads, vector<vector<double>>(contextMatrix.size(), vector<double>(contextMatrix[0].size(), 0.0)));
+        vector<vector<vector<double>>> threadEmbeddingGrads(nThreads, vector<vector<double>>(embeddingMatrix.size(), vector<double>(embeddingMatrix[0].size(), 0.0)));
+        vector<double> threadLosses(nThreads, 0.0);
 
-            vector<double> contextResult(vocabulary.size(), 0.0);
-            for (size_t k = 0; k < vocabulary.size(); ++k)
-                for (size_t l = 0; l < embeddingResult.size(); ++l)
-                    contextResult[k] += embeddingResult[l] * contextMatrix[l][k];
+        #pragma omp parallel
+        {
+            int tid = omp_get_thread_num();
+            auto &localContextGrad = threadContextGrads[tid];
+            auto &localEmbeddingGrad = threadEmbeddingGrads[tid];
+            double &localLoss = threadLosses[tid];
 
-            vector<double> softmaxResult(vocabulary.size(), 0.0);
-            double sumExp = 0.0;
-            for (const auto &val : contextResult)
-                sumExp += exp(val);
-            for (size_t k = 0; k < contextResult.size(); ++k)
-                softmaxResult[k] = exp(contextResult[k]) / sumExp;
-
-            // Target: next word
-            if (i + 1 < words.size())
+            #pragma omp for schedule(static)
+            for (size_t i = 0; i < words.size(); ++i)
             {
-                auto targetIt = wordToIndex.find(words[i + 1]);
-                if (targetIt == wordToIndex.end())
+                vector<double> oneHot(vocabulary.size(), 0.0);
+                auto it = wordToIndex.find(words[i]);
+                if (it == wordToIndex.end())
                     continue;
-                size_t targetWordIndex = targetIt->second;
+                size_t currentWordIndex = it->second;
+                oneHot[currentWordIndex] = 1.0;
 
-                double crossEntropyLoss = -log(softmaxResult[targetWordIndex]);
-                totalLoss += crossEntropyLoss;
+                // Forward pass
+                vector<double> embeddingResult(embeddingMatrix[0].size(), 0.0);
+                for (size_t k = 0; k < embeddingMatrix[0].size(); ++k)
+                    for (size_t l = 0; l < vocabulary.size(); ++l)
+                        embeddingResult[k] += oneHot[l] * embeddingMatrix[l][k];
 
-                // Backpropagation
-                vector<double> softmaxGradient = softmaxResult;
-                softmaxGradient[targetWordIndex] -= 1.0;
-                for (size_t d = 0; d < embeddingResult.size(); d++)
-                    for (size_t w = 0; w < vocabulary.size(); w++)
-                        contextMatrix[d][w] -= learningRate * embeddingResult[d] * softmaxGradient[w];
+                vector<double> contextResult(vocabulary.size(), 0.0);
+                for (size_t k = 0; k < vocabulary.size(); ++k)
+                    for (size_t l = 0; l < embeddingResult.size(); ++l)
+                        contextResult[k] += embeddingResult[l] * contextMatrix[l][k];
 
-                vector<double> embeddingGradient(embeddingResult.size(), 0.0);
-                for (size_t d = 0; d < embeddingResult.size(); d++)
-                    for (size_t w = 0; w < vocabulary.size(); w++)
-                        embeddingGradient[d] += softmaxGradient[w] * contextMatrix[d][w];
+               vector<double> softmaxResult(vocabulary.size(), 0.0);
+double maxVal = *max_element(contextResult.begin(), contextResult.end());
+double sumExp = 0.0;
+for (const auto &val : contextResult)
+    sumExp += exp(val - maxVal);
+for (size_t k = 0; k < contextResult.size(); ++k)
+    softmaxResult[k] = exp(contextResult[k] - maxVal) / sumExp;
+                // Target: next word
+                if (i + 1 < words.size())
+                {
+                    auto targetIt = wordToIndex.find(words[i + 1]);
+                    if (targetIt == wordToIndex.end())
+                        continue;
+                    size_t targetWordIndex = targetIt->second;
 
-                for (size_t d = 0; d < embeddingResult.size(); d++)
-                    embeddingMatrix[currentWordIndex][d] -= learningRate * embeddingGradient[d];
+                    const double EPS = 1e-10;
+double crossEntropyLoss = -log(softmaxResult[targetWordIndex] + EPS);
+                    localLoss += crossEntropyLoss;
+
+                    // Backpropagation
+                    vector<double> softmaxGradient = softmaxResult;
+                    softmaxGradient[targetWordIndex] -= 1.0;
+
+                    // Gradients
+                    for (size_t d = 0; d < embeddingResult.size(); d++)
+                        for (size_t w = 0; w < vocabulary.size(); w++)
+                            localContextGrad[d][w] += embeddingResult[d] * softmaxGradient[w];
+
+                    for (size_t d = 0; d < embeddingResult.size(); d++)
+                        for (size_t w = 0; w < vocabulary.size(); w++)
+                            localEmbeddingGrad[currentWordIndex][d] += softmaxGradient[w] * contextMatrix[d][w];
+                }
             }
         }
+
+        // Sum thread-local gradients into global gradients
+        for (int t = 0; t < nThreads; ++t)
+        {
+            for (size_t d = 0; d < contextMatrix.size(); d++)
+                for (size_t w = 0; w < contextMatrix[0].size(); w++)
+                    contextMatrixGrad[d][w] += threadContextGrads[t][d][w];
+
+            for (size_t i = 0; i < embeddingMatrix.size(); i++)
+                for (size_t d = 0; d < embeddingMatrix[0].size(); d++)
+                    embeddingMatrixGrad[i][d] += threadEmbeddingGrads[t][i][d];
+
+            totalLoss += threadLosses[t];
+        }
+
+        // Update weights (outside parallel region)
+        for (size_t d = 0; d < contextMatrix.size(); d++)
+            for (size_t w = 0; w < contextMatrix[0].size(); w++)
+                contextMatrix[d][w] -= learningRate * contextMatrixGrad[d][w];
+
+        for (size_t i = 0; i < embeddingMatrix.size(); i++)
+            for (size_t d = 0; d < embeddingMatrix[0].size(); d++)
+                embeddingMatrix[i][d] -= learningRate * embeddingMatrixGrad[i][d];
+
         if (epoch % 10 == 0 || epoch == numEpochs - 1)
             cout << "Epoch " << epoch << ", Average Loss: " << totalLoss / words.size() << endl;
     }
