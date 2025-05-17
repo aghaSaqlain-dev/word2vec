@@ -10,8 +10,8 @@
 #include <unordered_set>
 #include <unordered_map>
 #include <cuda_runtime.h>
-#include <device_launch_parameters.h>
 #include <cuda.h>
+#include <cfloat>
 
 using namespace std;
 
