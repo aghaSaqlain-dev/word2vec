@@ -7,6 +7,7 @@
 #include <string>
 #include <limits>
 #include <fstream>
+#include <sstream>
 #include <unordered_set>
 #include <unordered_map>
 #include <omp.h>
@@ -48,16 +49,6 @@ string findMostSimilarWord(const vector<double> &wordEmbedding,
         }
     }
     return vocabulary[bestWordIndex];
-}
-
-// Fill a matrix with random values
-void fillMatrixWithRandomValues(vector<vector<double>> &matrix, int rows, int cols)
-{
-    srand(static_cast<unsigned>(time(0)));
-    matrix.resize(rows, vector<double>(cols));
-    for (int i = 0; i < rows; ++i)
-        for (int j = 0; j < cols; ++j)
-            matrix[i][j] = static_cast<double>(rand()) / RAND_MAX;
 }
 
 // Efficiently build vocabulary from words
@@ -105,7 +96,7 @@ void trainModel(
     int numEpochs,
     double learningRate)
 {
-    for (int epoch = 0; epoch < numEpochs; epoch++)
+    for (int epoch = 0; epoch < numEpochs; epoch++) //100 for now
     {
         double totalLoss = 0.0;
 
@@ -154,39 +145,39 @@ void trainModel(
                         contextResult[k] += embeddingResult[l] * contextMatrix[l][k];
 
                vector<double> softmaxResult(vocabulary.size(), 0.0);
-double maxVal = *max_element(contextResult.begin(), contextResult.end());
-double sumExp = 0.0;
-for (const auto &val : contextResult)
-    sumExp += exp(val - maxVal);
-for (size_t k = 0; k < contextResult.size(); ++k)
-    softmaxResult[k] = exp(contextResult[k] - maxVal) / sumExp;
-                // Target: next word
-                if (i + 1 < words.size())
-                {
-                    auto targetIt = wordToIndex.find(words[i + 1]);
-                    if (targetIt == wordToIndex.end())
-                        continue;
-                    size_t targetWordIndex = targetIt->second;
+        double maxVal = *max_element(contextResult.begin(), contextResult.end());
+        double sumExp = 0.0;
+        for (const auto &val : contextResult)
+            sumExp += exp(val - maxVal);
+        for (size_t k = 0; k < contextResult.size(); ++k)
+            softmaxResult[k] = exp(contextResult[k] - maxVal) / sumExp;
+                        // Target: next word
+                        if (i + 1 < words.size())
+                        {
+                            auto targetIt = wordToIndex.find(words[i + 1]);
+                            if (targetIt == wordToIndex.end())
+                                continue;
+                            size_t targetWordIndex = targetIt->second;
 
-                    const double EPS = 1e-10;
-double crossEntropyLoss = -log(softmaxResult[targetWordIndex] + EPS);
-                    localLoss += crossEntropyLoss;
+                            const double EPS = 1e-10;
+        double crossEntropyLoss = -log(softmaxResult[targetWordIndex] + EPS);
+                            localLoss += crossEntropyLoss;
 
-                    // Backpropagation
-                    vector<double> softmaxGradient = softmaxResult;
-                    softmaxGradient[targetWordIndex] -= 1.0;
+                            // Backpropagation
+                            vector<double> softmaxGradient = softmaxResult;
+                            softmaxGradient[targetWordIndex] -= 1.0;
 
-                    // Gradients
-                    for (size_t d = 0; d < embeddingResult.size(); d++)
-                        for (size_t w = 0; w < vocabulary.size(); w++)
-                            localContextGrad[d][w] += embeddingResult[d] * softmaxGradient[w];
+                            // Gradients
+                            for (size_t d = 0; d < embeddingResult.size(); d++)
+                                for (size_t w = 0; w < vocabulary.size(); w++)
+                                    localContextGrad[d][w] += embeddingResult[d] * softmaxGradient[w];
 
-                    for (size_t d = 0; d < embeddingResult.size(); d++)
-                        for (size_t w = 0; w < vocabulary.size(); w++)
-                            localEmbeddingGrad[currentWordIndex][d] += softmaxGradient[w] * contextMatrix[d][w];
+                            for (size_t d = 0; d < embeddingResult.size(); d++)
+                                for (size_t w = 0; w < vocabulary.size(); w++)
+                                    localEmbeddingGrad[currentWordIndex][d] += softmaxGradient[w] * contextMatrix[d][w];
+                        }
+                    }
                 }
-            }
-        }
 
         // Sum thread-local gradients into global gradients
         for (int t = 0; t < nThreads; ++t)
@@ -296,11 +287,43 @@ int main()
     for (size_t i = 0; i < vocabulary.size(); ++i)
         wordToIndex[vocabulary[i]] = i;
 
-    // Initialize matrices
+    // Read embedding matrix from file
     vector<vector<double>> embeddingMatrix;
-    fillMatrixWithRandomValues(embeddingMatrix, vocabulary.size(), 3);
+    ifstream embFile("embedding_matrix.txt");
+    if (embFile.is_open()) {
+        string line;
+        while (getline(embFile, line)) {
+            istringstream iss(line);
+            vector<double> row;
+            double val;
+            while (iss >> val)
+                row.push_back(val);
+            embeddingMatrix.push_back(row);
+        }
+        embFile.close();
+    } else {
+        cerr << "Error: Unable to open file 'embedding_matrix.txt'" << endl;
+        return 1;
+    }
+
+    // Read context matrix from file
     vector<vector<double>> contextMatrix;
-    fillMatrixWithRandomValues(contextMatrix, 3, vocabulary.size());
+    ifstream ctxFile("context_matrix.txt");
+    if (ctxFile.is_open()) {
+        string line;
+        while (getline(ctxFile, line)) {
+            istringstream iss(line);
+            vector<double> row;
+            double val;
+            while (iss >> val)
+                row.push_back(val);
+            contextMatrix.push_back(row);
+        }
+        ctxFile.close();
+    } else {
+        cerr << "Error: Unable to open file 'context_matrix.txt'" << endl;
+        return 1;
+    }
 
     // Print initial matrices (optional, comment out for large vocab)
     // printMatrix(embeddingMatrix, vocabulary, "Embedding Matrix:");
