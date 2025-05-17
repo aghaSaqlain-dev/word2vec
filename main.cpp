@@ -474,6 +474,7 @@ int main()
     cout << "- Negative samples: " << NEG_SAMPLES << endl;
     cout << "- Subsampling threshold: " << SUBSAMPLE_THRESHOLD << endl;
     cout << "- Initial learning rate: " << INITIAL_LEARNING_RATE << endl;
+    cout << "total words : " << vocabulary.size() <<endl;
     
     // Train model with all features
     trainModel(embeddingMatrix, contextMatrix, words, vocabulary, wordToIndex, 
