@@ -13,6 +13,7 @@
 #include <random>
 #include <omp.h>
 #include <cfloat>
+#include <chrono>
 
 using namespace std;
 
@@ -167,7 +168,7 @@ void trainModel(
     
     // Epoch loop with adaptive learning rate
     double prevLoss = DBL_MAX;
-    const double earlyStoppingThreshold = 0.001;
+    const double earlyStoppingThreshold = 0.00001;
     
     for (int epoch = 0; epoch < numEpochs; epoch++)
     {
@@ -475,12 +476,20 @@ int main()
     cout << "- Subsampling threshold: " << SUBSAMPLE_THRESHOLD << endl;
     cout << "- Initial learning rate: " << INITIAL_LEARNING_RATE << endl;
     cout << "total words : " << vocabulary.size() <<endl;
+
+    auto start_time = chrono::high_resolution_clock::now();
     
     // Train model with all features
     trainModel(embeddingMatrix, contextMatrix, words, vocabulary, wordToIndex, 
                wordFrequencies, NUM_EPOCHS, INITIAL_LEARNING_RATE, 
                WINDOW_SIZE, NEG_SAMPLES, SUBSAMPLE_THRESHOLD);
 
+    
+    auto end_time = chrono::high_resolution_clock::now();
+    auto duration = chrono::duration_cast<chrono::seconds>(end_time - start_time);
+           
+    cout << "Training completed in " << duration.count() << " seconds (" 
+         << duration.count()/60.0 << " minutes)" << endl;
     // Save final matrices
     ofstream embOutFinal("embedding_matrix_final.txt");
     for (const auto &row : embeddingMatrix) {
