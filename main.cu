@@ -11,7 +11,6 @@
 #include <unordered_set>
 #include <unordered_map>
 #include <random>
-#include <omp.h>
 #include <cfloat>
 #include <chrono>
 
@@ -96,11 +95,14 @@ double getSubsamplingProb(double freq, double threshold = 1e-5)
 // Helper to get a context vector from context matrix
 vector<double> getContextVector(const vector<vector<double>> &contextMatrix, size_t wordIndex)
 {
-    vector<double> contextVector(contextMatrix.size());
-    for (size_t j = 0; j < contextMatrix.size(); j++)
-        contextVector[j] = contextMatrix[j][wordIndex];
-    return contextVector;
+    vector<double> ctxVec(contextMatrix.size());
+    for (size_t d = 0; d < contextMatrix.size(); ++d)
+    {
+        ctxVec[d] = contextMatrix[d][wordIndex];
+    }
+    return ctxVec;
 }
+
 
 // Sigmoid function for negative sampling
 double sigmoid(double x)
@@ -122,6 +124,33 @@ void printMatrix(const vector<vector<double>> &matrix, const vector<string> &voc
     }
     cout << "------------------------" << endl;
 }
+__global__ void dotProductKernel(const double* a, const double* b, double* result, int size) {
+    __shared__ double cache[256]; // Adjust size as needed
+    int tid = threadIdx.x + blockIdx.x * blockDim.x;
+    int cacheIndex = threadIdx.x;
+
+    double temp = 0.0;
+    while (tid < size) {
+        temp += a[tid] * b[tid];
+        tid += blockDim.x * gridDim.x;
+    }
+
+    cache[cacheIndex] = temp;
+
+    __syncthreads();
+
+    // Reduction
+    int i = blockDim.x / 2;
+    while (i != 0) {
+        if (cacheIndex < i)
+            cache[cacheIndex] += cache[cacheIndex + i];
+        __syncthreads();
+        i /= 2;
+    }
+
+    if (cacheIndex == 0)
+        atomicAdd(result, cache[0]);
+}
 
 // Training loop with all Word2Vec features
 void trainModel(
@@ -137,186 +166,99 @@ void trainModel(
     int negSamples = 5,
     double subsampleThreshold = 1e-5)
 {
-    // Create noise distribution for negative sampling (based on word frequencies^0.75)
+    // Noise distribution
     vector<double> noiseDist(vocabulary.size());
-    double normalizationFactor = 0.0;
+    double normFactor = 0.0;
     for (size_t i = 0; i < vocabulary.size(); i++) {
         double freq = wordFrequencies.at(vocabulary[i]);
         noiseDist[i] = pow(freq, 0.75);
-        normalizationFactor += noiseDist[i];
+        normFactor += noiseDist[i];
     }
-    for (size_t i = 0; i < noiseDist.size(); i++) {
-        noiseDist[i] /= normalizationFactor;
-    }
+    for (double &val : noiseDist) val /= normFactor;
 
-    // Setup random generators for each thread
-    vector<mt19937> randomEngines;
-    vector<discrete_distribution<int>> negSamplers;
-    
-    int nThreads = 1;
-    #pragma omp parallel
-    {
-        #pragma omp single
-        nThreads = omp_get_num_threads();
-    }
-    
-    for (int t = 0; t < nThreads; t++) {
-        unsigned int seed = static_cast<unsigned int>(time(nullptr)) + t;
-        randomEngines.emplace_back(seed);
-        negSamplers.emplace_back(noiseDist.begin(), noiseDist.end());
-    }
-    
-    // Epoch loop with adaptive learning rate
+    mt19937 rng(static_cast<unsigned int>(time(nullptr)));
+    discrete_distribution<int> negSampler(noiseDist.begin(), noiseDist.end());
+    uniform_real_distribution<double> uniform(0.0, 1.0);
+
     double prevLoss = DBL_MAX;
-    const double earlyStoppingThreshold = 0.000001;
-    
-    for (int epoch = 0; epoch < numEpochs; epoch++)
-    {
-        double totalLoss = 0.0;
-        
-        // Adaptive learning rate (linear decay)
+    for (int epoch = 0; epoch < numEpochs; ++epoch) {
         double learningRate = initialLearningRate * (1.0 - static_cast<double>(epoch) / numEpochs);
-        
-        // Global gradients for model update
-        vector<vector<double>> contextMatrixGrad(contextMatrix.size(), vector<double>(contextMatrix[0].size(), 0.0));
-        vector<vector<double>> embeddingMatrixGrad(embeddingMatrix.size(), vector<double>(embeddingMatrix[0].size(), 0.0));
-        
-        // Thread-local gradient buffers
-        vector<vector<vector<double>>> threadContextGrads(nThreads, vector<vector<double>>(contextMatrix.size(), vector<double>(contextMatrix[0].size(), 0.0)));
-        vector<vector<vector<double>>> threadEmbeddingGrads(nThreads, vector<vector<double>>(embeddingMatrix.size(), vector<double>(embeddingMatrix[0].size(), 0.0)));
-        vector<double> threadLosses(nThreads, 0.0);
-        
-        #pragma omp parallel
-        {
-            int tid = omp_get_thread_num();
-            auto &localContextGrad = threadContextGrads[tid];
-            auto &localEmbeddingGrad = threadEmbeddingGrads[tid];
-            double &localLoss = threadLosses[tid];
-            
-            // Local RNG
-            auto &rng = randomEngines[tid];
-            auto &negativeSampler = negSamplers[tid];
-            uniform_real_distribution<double> uniform(0.0, 1.0);
-            
-            #pragma omp for schedule(static)
-            for (size_t i = 0; i < words.size(); ++i)
-            {
-                // Skip words based on subsampling probability
-                auto wordIt = wordToIndex.find(words[i]);
-                if (wordIt == wordToIndex.end())
-                    continue;
-                    
-                size_t currentWordIndex = wordIt->second;
-                double freq = wordFrequencies.at(words[i]);
-                double keepProb = getSubsamplingProb(freq, subsampleThreshold);
-                
-                if (uniform(rng) > keepProb)
-                    continue; // Skip this word
-                
-                // Process window context words
-                vector<double> embeddingResult = embeddingMatrix[currentWordIndex];
-                
-                // Iterate over context window
-                for (int j = -windowSize; j <= windowSize; j++)
-                {
-                    if (j == 0) continue; // Skip the central word
-                    
-                    size_t contextPos = i + j;
-                    if (contextPos >= words.size())
-                        continue;
-                        
-                    auto targetIt = wordToIndex.find(words[contextPos]);
-                    if (targetIt == wordToIndex.end())
-                        continue;
-                        
-                    size_t targetWordIndex = targetIt->second;
-                    
-                    // NEGATIVE SAMPLING: Train on target word (positive) and negative samples
-                    
-                    // Process positive example (target word)
-                    vector<double> contextVector = getContextVector(contextMatrix, targetWordIndex);
-                    double dotProduct = 0.0;
-                    for (size_t d = 0; d < embeddingResult.size(); d++)
-                        dotProduct += embeddingResult[d] * contextVector[d];
-                    
-                    double sigmoid_pos = sigmoid(dotProduct);
-                    double loss_pos = -log(sigmoid_pos + 1e-10);
-                    localLoss += loss_pos;
-                    
-                    // Update gradients for positive example
-                    double grad_pos = (sigmoid_pos - 1.0); // derivative of -log(sigmoid(x))
-                    
-                    // Update context matrix gradient for positive sample
-                    for (size_t d = 0; d < embeddingResult.size(); d++)
-                        localContextGrad[d][targetWordIndex] += grad_pos * embeddingResult[d];
-                        
-                    // Update embedding matrix gradient
-                    for (size_t d = 0; d < embeddingResult.size(); d++)
-                        localEmbeddingGrad[currentWordIndex][d] += grad_pos * contextVector[d];
-                    
-                    // Process negative examples
-                    for (int neg = 0; neg < negSamples; neg++)
-                    {
-                        // Sample a random negative word
-                        size_t negWordIndex = negativeSampler(rng);
-                        
-                        // Skip if we accidentally sample the target word
-                        if (negWordIndex == targetWordIndex)
-                            continue;
-                            
-                        vector<double> negContextVector = getContextVector(contextMatrix, negWordIndex);
-                        double negDotProduct = 0.0;
-                        for (size_t d = 0; d < embeddingResult.size(); d++)
-                            negDotProduct += embeddingResult[d] * negContextVector[d];
-                            
-                        double sigmoid_neg = sigmoid(negDotProduct);
-                        double loss_neg = -log(1.0 - sigmoid_neg + 1e-10);
-                        localLoss += loss_neg;
-                        
-                        // Update gradients for negative example
-                        double grad_neg = sigmoid_neg; // derivative of -log(1-sigmoid(x))
-                        
-                        // Update context matrix gradient for negative sample
-                        for (size_t d = 0; d < embeddingResult.size(); d++)
-                            localContextGrad[d][negWordIndex] += grad_neg * embeddingResult[d];
-                            
-                        // Update embedding matrix gradient
-                        for (size_t d = 0; d < embeddingResult.size(); d++)
-                            localEmbeddingGrad[currentWordIndex][d] += grad_neg * negContextVector[d];
+        double totalLoss = 0.0;
+
+        for (size_t i = 0; i < words.size(); ++i) {
+            auto it = wordToIndex.find(words[i]);
+            if (it == wordToIndex.end()) continue;
+            size_t currentWordIdx = it->second;
+            double freq = wordFrequencies.at(words[i]);
+            if (uniform(rng) > getSubsamplingProb(freq, subsampleThreshold)) continue;
+
+            vector<double> &embedVec = embeddingMatrix[currentWordIdx];
+
+            for (int j = -windowSize; j <= windowSize; ++j) {
+                if (j == 0) continue;
+                size_t ctxPos = i + j;
+                if (ctxPos >= words.size()) continue;
+
+                auto tgtIt = wordToIndex.find(words[ctxPos]);
+                if (tgtIt == wordToIndex.end()) continue;
+                size_t targetIdx = tgtIt->second;
+                vector<double> ctxVec = getContextVector(contextMatrix, targetIdx);
+
+                int dim = embedVec.size();
+                double *d_A, *d_B, *d_C;
+                cudaMalloc(&d_A, dim * sizeof(double));
+                cudaMalloc(&d_B, dim * sizeof(double));
+                cudaMalloc(&d_C, dim * sizeof(double));
+
+                cudaMemcpy(d_A, embedVec.data(), dim * sizeof(double), cudaMemcpyHostToDevice);
+                cudaMemcpy(d_B, ctxVec.data(), dim * sizeof(double), cudaMemcpyHostToDevice);
+
+                dotProductKernel<<<(dim + 255)/256, 256>>>(d_A, d_B, d_C, dim);
+
+                vector<double> result(dim);
+                cudaMemcpy(result.data(), d_C, dim * sizeof(double), cudaMemcpyDeviceToHost);
+
+                double dotProd = 0.0;
+                for (double v : result) dotProd += v;
+
+                double sigPos = sigmoid(dotProd);
+                double gradPos = sigPos - 1.0;
+                totalLoss += -log(sigPos + 1e-10);
+
+                for (size_t d = 0; d < dim; ++d) {
+                    contextMatrix[targetIdx][d] -= learningRate * gradPos * embedVec[d];
+                    embeddingMatrix[currentWordIdx][d] -= learningRate * gradPos * ctxVec[d];
+                }
+
+                for (int neg = 0; neg < negSamples; ++neg) {
+                    size_t negIdx = negSampler(rng);
+                    if (negIdx == targetIdx) continue;
+                    vector<double> negVec = getContextVector(contextMatrix, negIdx);
+
+                    cudaMemcpy(d_B, negVec.data(), dim * sizeof(double), cudaMemcpyHostToDevice);
+                    dotProductKernel<<<(dim + 255)/256, 256>>>(d_A, d_B, d_C, dim);
+                    cudaMemcpy(result.data(), d_C, dim * sizeof(double), cudaMemcpyDeviceToHost);
+
+                    double dotNeg = 0.0;
+                    for (double v : result) dotNeg += v;
+                    double sigNeg = sigmoid(dotNeg);
+                    double gradNeg = sigNeg;
+                    totalLoss += -log(1.0 - sigNeg + 1e-10);
+
+                    for (size_t d = 0; d < dim; ++d) {
+                        contextMatrix[negIdx][d] -= learningRate * gradNeg * embedVec[d];
+                        embeddingMatrix[currentWordIdx][d] -= learningRate * gradNeg * negVec[d];
                     }
                 }
+
+                cudaFree(d_A); cudaFree(d_B); cudaFree(d_C);
             }
         }
-        
-        // Sum thread-local gradients into global gradients
-        for (int t = 0; t < nThreads; ++t)
-        {
-            for (size_t d = 0; d < contextMatrix.size(); d++)
-                for (size_t w = 0; w < contextMatrix[0].size(); w++)
-                    contextMatrixGrad[d][w] += threadContextGrads[t][d][w];
 
-            for (size_t i = 0; i < embeddingMatrix.size(); i++)
-                for (size_t d = 0; d < embeddingMatrix[0].size(); d++)
-                    embeddingMatrixGrad[i][d] += threadEmbeddingGrads[t][i][d];
+        cout << "Epoch " << epoch << ", Learning Rate: " << learningRate
+             << ", Avg Loss: " << totalLoss / words.size() << endl;
 
-            totalLoss += threadLosses[t];
-        }
-        
-        // Update weights with adaptive learning rate
-        for (size_t d = 0; d < contextMatrix.size(); d++)
-            for (size_t w = 0; w < contextMatrix[0].size(); w++)
-                contextMatrix[d][w] -= learningRate * contextMatrixGrad[d][w];
-
-        for (size_t i = 0; i < embeddingMatrix.size(); i++)
-            for (size_t d = 0; d < embeddingMatrix[0].size(); d++)
-                embeddingMatrix[i][d] -= learningRate * embeddingMatrixGrad[i][d];
-                
-        if (epoch % 10 == 0 || epoch == numEpochs - 1)
-            cout << "Epoch " << epoch << ", Learning Rate: " << learningRate 
-                 << ", Average Loss: " << totalLoss / words.size() << endl;
-                 
-        // Early stopping
-        if (epoch > 10 && abs(prevLoss - totalLoss) < earlyStoppingThreshold * prevLoss) {
+        if (epoch > 10 && abs(prevLoss - totalLoss) < 0.01 * prevLoss) {
             cout << "Early stopping at epoch " << epoch << endl;
             break;
         }
@@ -351,24 +293,16 @@ void interactivePrediction(
             continue;
         }
         size_t wordIndex = wordIt->second;
-        vector<double> wordEmbedding = embeddingMatrix[wordIndex];
+const vector<double> &wordEmbedding = embeddingMatrix[wordIndex];
 
-        // Compute similarities for all words
-        vector<pair<string, double>> similarities;
-        for (size_t i = 0; i < vocabulary.size(); i++)
-        {
-            vector<double> contextVector(contextMatrix.size());
-            for (size_t j = 0; j < contextMatrix.size(); j++) {
-                if (i < contextMatrix[j].size()) { // Safety check
-                    contextVector[j] = contextMatrix[j][i];
-                } else {
-                    cerr << "Index out of bounds: " << i << " >= " << contextMatrix[j].size() << endl;
-                    contextVector[j] = 0.0;
-                }
-            }
-            double similarity = cosineSimilarity(wordEmbedding, contextVector);
-            similarities.emplace_back(vocabulary[i], similarity);
-        }
+vector<pair<string, double>> similarities;
+for (size_t i = 0; i < vocabulary.size(); i++)
+{
+    const vector<double> &contextVector = contextMatrix[i];
+    double similarity = cosineSimilarity(wordEmbedding, contextVector);
+    similarities.emplace_back(vocabulary[i], similarity);
+}
+
 
         // Sort by similarity in descending order
         sort(similarities.begin(), similarities.end(),
@@ -433,7 +367,7 @@ int main()
     double xavier_limit = sqrt(6.0 / (vocabulary.size() + EMBEDDING_DIM));
     
     vector<vector<double>> embeddingMatrix(vocabulary.size(), vector<double>(EMBEDDING_DIM));
-    vector<vector<double>> contextMatrix(EMBEDDING_DIM, vector<double>(vocabulary.size()));
+vector<vector<double>> contextMatrix(vocabulary.size(), vector<double>(EMBEDDING_DIM));
     
     // Initialize with Xavier/Glorot initialization
     mt19937 rng(time(nullptr));
@@ -452,7 +386,7 @@ int main()
     }
     
     // Save initial matrices (optional)
-    ofstream embOut("embedding_matrix_initial.txt");
+    ofstream embOut("embedding_matrix.txt");
     for (const auto &row : embeddingMatrix) {
         for (size_t j = 0; j < row.size(); j++) {
             embOut << row[j] << (j + 1 < row.size() ? " " : "");
@@ -461,7 +395,7 @@ int main()
     }
     embOut.close();
     
-    ofstream ctxOut("context_matrix_initial.txt");
+    ofstream ctxOut("context_matrix.txt");
     for (const auto &row : contextMatrix) {
         for (size_t j = 0; j < row.size(); j++) {
             ctxOut << row[j] << (j + 1 < row.size() ? " " : "");
@@ -490,7 +424,7 @@ int main()
     cout << "Training completed in " << duration.count() << " seconds (" 
          << duration.count()/60.0 << " minutes)" << endl;              
     // Save final matrices
-    ofstream embOutFinal("embedding_matrix_final.txt");
+    ofstream embOutFinal("embedding_matrix.txt");
     for (const auto &row : embeddingMatrix) {
         for (size_t j = 0; j < row.size(); j++) {
             embOutFinal << row[j] << (j + 1 < row.size() ? " " : "");
@@ -499,7 +433,7 @@ int main()
     }
     embOutFinal.close();
     
-    ofstream ctxOutFinal("context_matrix_final.txt");
+    ofstream ctxOutFinal("context_matrix.txt");
     for (const auto &row : contextMatrix) {
         for (size_t j = 0; j < row.size(); j++) {
             ctxOutFinal << row[j] << (j + 1 < row.size() ? " " : "");
