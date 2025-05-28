@@ -13,8 +13,344 @@
 #include <random>
 #include <cfloat>
 #include <chrono>
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
 
 using namespace std;
+
+// CUDA error checking macro
+#define CUDA_CHECK(call) { const cudaError_t error = call; if (error != cudaSuccess) { printf("CUDA error: %s, %s, line %d\n", cudaGetErrorString(error), __FILE__, __LINE__); exit(1); } }
+
+// Define batch size for processing
+#define BATCH_SIZE 1024
+
+// Forward declarations
+double getSubsamplingProb(double freq, double threshold);
+double sigmoid(double x);
+vector<double> getContextVector(const vector<vector<double>> &contextMatrix, size_t wordIndex);
+
+// CUDA kernel for sigmoid calculation
+__global__ void sigmoidKernel(double* dot_products, double* sigmoid_outputs, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        sigmoid_outputs[idx] = 1.0 / (1.0 + exp(-dot_products[idx]));
+    }
+}
+
+// CUDA kernel for computing gradient updates
+__global__ void gradientKernel(double* embeddings, double* contexts, double* gradients, 
+                             int* word_indices, int* context_indices, double learning_rate,
+                             int embedding_dim, int size, bool is_negative) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = blockDim.x * gridDim.x;
+    
+    for (int i = idx; i < size; i += stride) {
+        int word_idx = word_indices[i];
+        int ctx_idx = context_indices[i];
+        double grad = gradients[i];
+        
+        // If this is a negative sample, we use different gradient
+        if (is_negative) {
+            grad = grad; // For negative samples, grad = sigmoid
+        } else {
+            grad = grad - 1.0; // For positive samples, grad = sigmoid - 1
+        }
+        
+        for (int d = 0; d < embedding_dim; d++) {
+            // Update both embedding and context vectors
+            double embed_update = -learning_rate * grad * contexts[ctx_idx * embedding_dim + d];
+            double context_update = -learning_rate * grad * embeddings[word_idx * embedding_dim + d];
+            
+            // Use atomic operations to avoid race conditions
+            atomicAdd(&embeddings[word_idx * embedding_dim + d], embed_update);
+            atomicAdd(&contexts[ctx_idx * embedding_dim + d], context_update);
+        }
+    }
+}
+
+// CUDA kernel for batch dot product calculation
+__global__ void batchDotProductKernel(double* embeddings, double* contexts, 
+                                    int* word_indices, int* context_indices,
+                                    double* dot_products, int embedding_dim, int batch_size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < batch_size) {
+        int word_idx = word_indices[idx];
+        int ctx_idx = context_indices[idx];
+        
+        double dot = 0.0;
+        for (int d = 0; d < embedding_dim; d++) {
+            dot += embeddings[word_idx * embedding_dim + d] * contexts[ctx_idx * embedding_dim + d];
+        }
+        dot_products[idx] = dot;
+    }
+}
+
+// Dot product kernel for shared memory reduction
+__global__ void dotProductKernel(const double* a, const double* b, double* result, int size) {
+    __shared__ double cache[256]; // Adjust size as needed
+    int tid = threadIdx.x + blockIdx.x * blockDim.x;
+    int cacheIndex = threadIdx.x;
+
+    double temp = 0.0;
+    while (tid < size) {
+        temp += a[tid] * b[tid];
+        tid += blockDim.x * gridDim.x;
+    }
+
+    cache[cacheIndex] = temp;
+
+    __syncthreads();
+
+    // Reduction
+    int i = blockDim.x / 2;
+    while (i != 0) {
+        if (cacheIndex < i)
+            cache[cacheIndex] += cache[cacheIndex + i];
+        __syncthreads();
+        i /= 2;
+    }
+
+    if (cacheIndex == 0)
+        atomicAdd(result, cache[0]);
+}
+
+// Replace lines 116-128 with this:
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 600
+__device__ double atomicAdd(double* address, double val) {
+    unsigned long long int* address_as_ull = (unsigned long long int*)address;
+    unsigned long long int old = *address_as_ull, assumed;
+    do {
+        assumed = old;
+        old = atomicCAS(address_as_ull, assumed,
+                __double_as_longlong(val + __longlong_as_double(assumed)));
+    } while (assumed != old);
+    return __longlong_as_double(old);
+}
+#endif
+
+void trainModel(
+    vector<vector<double>> &embeddingMatrix,
+    vector<vector<double>> &contextMatrix,
+    const vector<string> &words,
+    const vector<string> &vocabulary,
+    const unordered_map<string, size_t> &wordToIndex,
+    const unordered_map<string, double> &wordFrequencies,
+    int numEpochs,
+    double initialLearningRate,
+    int windowSize = 2,
+    int negSamples = 5,
+    double subsampleThreshold = 1e-5)
+{
+    int vocabSize = vocabulary.size();
+    int embeddingDim = embeddingMatrix[0].size();
+    
+    // Flatten matrices for GPU (row-major layout)
+    vector<double> flat_embeddings(vocabSize * embeddingDim);
+    vector<double> flat_contexts(vocabSize * embeddingDim);
+    
+    for (int i = 0; i < vocabSize; i++) {
+        for (int j = 0; j < embeddingDim; j++) {
+            flat_embeddings[i * embeddingDim + j] = embeddingMatrix[i][j];
+            flat_contexts[i * embeddingDim + j] = contextMatrix[i][j];
+        }
+    }
+    
+    // Allocate device memory ONCE (not in the loop)
+    double *d_embeddings, *d_contexts;
+    double *d_dot_products, *d_sigmoids;
+    int *d_word_indices, *d_context_indices;
+    
+    // Allocate memory for matrices
+    CUDA_CHECK(cudaMalloc(&d_embeddings, vocabSize * embeddingDim * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&d_contexts, vocabSize * embeddingDim * sizeof(double)));
+    
+    // Allocate memory for batch processing
+    CUDA_CHECK(cudaMalloc(&d_dot_products, BATCH_SIZE * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&d_sigmoids, BATCH_SIZE * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&d_word_indices, BATCH_SIZE * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_context_indices, BATCH_SIZE * sizeof(int)));
+    
+    // Copy matrices to device
+    CUDA_CHECK(cudaMemcpy(d_embeddings, flat_embeddings.data(), 
+                        vocabSize * embeddingDim * sizeof(double), 
+                        cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_contexts, flat_contexts.data(), 
+                        vocabSize * embeddingDim * sizeof(double), 
+                        cudaMemcpyHostToDevice));
+    
+    // Prepare for negative sampling
+    vector<double> noiseDist(vocabSize);
+    double normFactor = 0.0;
+    for (size_t i = 0; i < vocabSize; i++) {
+        double freq = wordFrequencies.at(vocabulary[i]);
+        noiseDist[i] = pow(freq, 0.75);
+        normFactor += noiseDist[i];
+    }
+    for (double &val : noiseDist) val /= normFactor;
+    
+    mt19937 rng(static_cast<unsigned int>(time(nullptr)));
+    discrete_distribution<int> negSampler(noiseDist.begin(), noiseDist.end());
+    uniform_real_distribution<double> uniform(0.0, 1.0);
+    
+    // Host arrays for batch processing
+    vector<int> batch_word_indices(BATCH_SIZE);
+    vector<int> batch_context_indices(BATCH_SIZE);
+    vector<double> batch_dot_products(BATCH_SIZE);
+    vector<double> batch_sigmoids(BATCH_SIZE);
+    
+    // Training loop
+    double prevLoss = DBL_MAX;
+    for (int epoch = 0; epoch < numEpochs; ++epoch) {
+        double learningRate = initialLearningRate * (1.0 - static_cast<double>(epoch) / numEpochs);
+        double totalLoss = 0.0;
+        int batch_count = 0;
+        
+        // Create training pairs for this epoch
+        vector<pair<int, int>> positive_pairs;
+        for (size_t i = 0; i < words.size(); ++i) {
+            auto it = wordToIndex.find(words[i]);
+            if (it == wordToIndex.end()) continue;
+            int currentWordIdx = it->second;
+            double freq = wordFrequencies.at(words[i]);
+            if (uniform(rng) > getSubsamplingProb(freq, subsampleThreshold)) continue;
+            
+            for (int j = -windowSize; j <= windowSize; ++j) {
+                if (j == 0) continue;
+                size_t ctxPos = i + j;
+                if (ctxPos >= words.size()) continue;
+                
+                auto tgtIt = wordToIndex.find(words[ctxPos]);
+                if (tgtIt == wordToIndex.end()) continue;
+                int targetIdx = tgtIt->second;
+                
+                positive_pairs.push_back({currentWordIdx, targetIdx});
+            }
+        }
+        
+        // Shuffle positive pairs for better training
+        shuffle(positive_pairs.begin(), positive_pairs.end(), rng);
+        
+        // Process in batches
+        for (size_t pair_idx = 0; pair_idx < positive_pairs.size(); pair_idx += BATCH_SIZE) {
+            int current_batch_size = min(BATCH_SIZE, (int)(positive_pairs.size() - pair_idx));
+            
+            // Fill batch with positive samples
+            for (int i = 0; i < current_batch_size; i++) {
+                batch_word_indices[i] = positive_pairs[pair_idx + i].first;
+                batch_context_indices[i] = positive_pairs[pair_idx + i].second;
+            }
+            
+            // Copy batch to device
+            CUDA_CHECK(cudaMemcpy(d_word_indices, batch_word_indices.data(), 
+                               current_batch_size * sizeof(int), cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(d_context_indices, batch_context_indices.data(), 
+                               current_batch_size * sizeof(int), cudaMemcpyHostToDevice));
+            
+            // Calculate dot products for positive samples
+            batchDotProductKernel<<<(current_batch_size + 255)/256, 256>>>(
+                d_embeddings, d_contexts, d_word_indices, d_context_indices,
+                d_dot_products, embeddingDim, current_batch_size);
+            
+            // Calculate sigmoids
+            sigmoidKernel<<<(current_batch_size + 255)/256, 256>>>(
+                d_dot_products, d_sigmoids, current_batch_size);
+            
+            // Copy results back to host
+            CUDA_CHECK(cudaMemcpy(batch_sigmoids.data(), d_sigmoids, 
+                               current_batch_size * sizeof(double), cudaMemcpyDeviceToHost));
+            
+            // Update gradients for positive samples
+            gradientKernel<<<32, 256>>>(d_embeddings, d_contexts, d_sigmoids, 
+                                      d_word_indices, d_context_indices, learningRate,
+                                      embeddingDim, current_batch_size, false);
+            
+            // Calculate loss for positive samples
+            for (int i = 0; i < current_batch_size; i++) {
+                totalLoss += -log(batch_sigmoids[i] + 1e-10);
+            }
+            
+            // Process negative samples
+            for (int neg = 0; neg < negSamples; neg++) {
+                // Generate negative samples
+                for (int i = 0; i < current_batch_size; i++) {
+                    batch_context_indices[i] = negSampler(rng);
+                    
+                    // Make sure negative sample is not the positive context
+                    while (batch_context_indices[i] == positive_pairs[pair_idx + i].second) {
+                        batch_context_indices[i] = negSampler(rng);
+                    }
+                }
+                
+                // Copy negative context indices to device
+                CUDA_CHECK(cudaMemcpy(d_context_indices, batch_context_indices.data(), 
+                                   current_batch_size * sizeof(int), cudaMemcpyHostToDevice));
+                
+                // Calculate dot products for negative samples
+                batchDotProductKernel<<<(current_batch_size + 255)/256, 256>>>(
+                    d_embeddings, d_contexts, d_word_indices, d_context_indices,
+                    d_dot_products, embeddingDim, current_batch_size);
+                
+                // Calculate sigmoids for negative samples
+                sigmoidKernel<<<(current_batch_size + 255)/256, 256>>>(
+                    d_dot_products, d_sigmoids, current_batch_size);
+                
+                // Copy results back to host
+                CUDA_CHECK(cudaMemcpy(batch_sigmoids.data(), d_sigmoids, 
+                                   current_batch_size * sizeof(double), cudaMemcpyDeviceToHost));
+                
+                // Update gradients for negative samples
+                gradientKernel<<<32, 256>>>(d_embeddings, d_contexts, d_sigmoids, 
+                                          d_word_indices, d_context_indices, learningRate,
+                                          embeddingDim, current_batch_size, true);
+                
+                // Calculate loss for negative samples
+                for (int i = 0; i < current_batch_size; i++) {
+                    totalLoss += -log(1.0 - batch_sigmoids[i] + 1e-10);
+                }
+            }
+            
+            batch_count++;
+            if (batch_count % 100 == 0) {
+                cout << "Epoch " << epoch << ", Batch " << batch_count 
+                     << ", Processed " << batch_count * BATCH_SIZE << " examples" << endl;
+            }
+        }
+        
+        // Copy updated matrices back to host
+        CUDA_CHECK(cudaMemcpy(flat_embeddings.data(), d_embeddings, 
+                           vocabSize * embeddingDim * sizeof(double), 
+                           cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(flat_contexts.data(), d_contexts, 
+                           vocabSize * embeddingDim * sizeof(double), 
+                           cudaMemcpyDeviceToHost));
+        
+        // Convert flat arrays back to matrices
+        for (int i = 0; i < vocabSize; i++) {
+            for (int j = 0; j < embeddingDim; j++) {
+                embeddingMatrix[i][j] = flat_embeddings[i * embeddingDim + j];
+                contextMatrix[i][j] = flat_contexts[i * embeddingDim + j];
+            }
+        }
+        
+        cout << "Epoch " << epoch << ", Learning Rate: " << learningRate
+             << ", Avg Loss: " << totalLoss / words.size() << endl;
+             
+        // Early stopping
+        if (epoch > 10 && abs(prevLoss - totalLoss) < 0.01 * prevLoss) {
+            cout << "Early stopping at epoch " << epoch << endl;
+            break;
+        }
+        prevLoss = totalLoss;
+    }
+    
+    // Free device memory
+    cudaFree(d_embeddings);
+    cudaFree(d_contexts);
+    cudaFree(d_dot_products);
+    cudaFree(d_sigmoids);
+    cudaFree(d_word_indices);
+    cudaFree(d_context_indices);
+}
 
 // Cosine similarity between two vectors
 double cosineSimilarity(const vector<double> &vec1, const vector<double> &vec2)
@@ -50,10 +386,7 @@ string findMostSimilarWord(const vector<double> &wordEmbedding,
     size_t bestWordIndex = 0;
     for (size_t i = 0; i < vocabulary.size(); i++)
     {
-        vector<double> contextVector(contextMatrix.size());
-        for (size_t j = 0; j < contextMatrix.size(); j++)
-            contextVector[j] = contextMatrix[j][i];
-        double similarity = cosineSimilarity(wordEmbedding, contextVector);
+        double similarity = cosineSimilarity(wordEmbedding, contextMatrix[i]);
         if (similarity > maxSimilarity)
         {
             maxSimilarity = similarity;
@@ -85,7 +418,7 @@ unordered_map<string, double> computeWordFrequencies(const vector<string> &words
 }
 
 // Calculate sub-sampling probability for a word
-double getSubsamplingProb(double freq, double threshold = 1e-5)
+double getSubsamplingProb(double freq, double threshold)
 {
     if (freq < threshold)
         return 1.0;
@@ -95,14 +428,8 @@ double getSubsamplingProb(double freq, double threshold = 1e-5)
 // Helper to get a context vector from context matrix
 vector<double> getContextVector(const vector<vector<double>> &contextMatrix, size_t wordIndex)
 {
-    vector<double> ctxVec(contextMatrix.size());
-    for (size_t d = 0; d < contextMatrix.size(); ++d)
-    {
-        ctxVec[d] = contextMatrix[d][wordIndex];
-    }
-    return ctxVec;
+    return contextMatrix[wordIndex];
 }
-
 
 // Sigmoid function for negative sampling
 double sigmoid(double x)
@@ -123,147 +450,6 @@ void printMatrix(const vector<vector<double>> &matrix, const vector<string> &voc
         cout << endl;
     }
     cout << "------------------------" << endl;
-}
-__global__ void dotProductKernel(const double* a, const double* b, double* result, int size) {
-    __shared__ double cache[256]; // Adjust size as needed
-    int tid = threadIdx.x + blockIdx.x * blockDim.x;
-    int cacheIndex = threadIdx.x;
-
-    double temp = 0.0;
-    while (tid < size) {
-        temp += a[tid] * b[tid];
-        tid += blockDim.x * gridDim.x;
-    }
-
-    cache[cacheIndex] = temp;
-
-    __syncthreads();
-
-    // Reduction
-    int i = blockDim.x / 2;
-    while (i != 0) {
-        if (cacheIndex < i)
-            cache[cacheIndex] += cache[cacheIndex + i];
-        __syncthreads();
-        i /= 2;
-    }
-
-    if (cacheIndex == 0)
-        atomicAdd(result, cache[0]);
-}
-
-// Training loop with all Word2Vec features
-void trainModel(
-    vector<vector<double>> &embeddingMatrix,
-    vector<vector<double>> &contextMatrix,
-    const vector<string> &words,
-    const vector<string> &vocabulary,
-    const unordered_map<string, size_t> &wordToIndex,
-    const unordered_map<string, double> &wordFrequencies,
-    int numEpochs,
-    double initialLearningRate,
-    int windowSize = 2,
-    int negSamples = 5,
-    double subsampleThreshold = 1e-5)
-{
-    // Noise distribution
-    vector<double> noiseDist(vocabulary.size());
-    double normFactor = 0.0;
-    for (size_t i = 0; i < vocabulary.size(); i++) {
-        double freq = wordFrequencies.at(vocabulary[i]);
-        noiseDist[i] = pow(freq, 0.75);
-        normFactor += noiseDist[i];
-    }
-    for (double &val : noiseDist) val /= normFactor;
-
-    mt19937 rng(static_cast<unsigned int>(time(nullptr)));
-    discrete_distribution<int> negSampler(noiseDist.begin(), noiseDist.end());
-    uniform_real_distribution<double> uniform(0.0, 1.0);
-
-    double prevLoss = DBL_MAX;
-    for (int epoch = 0; epoch < numEpochs; ++epoch) {
-        double learningRate = initialLearningRate * (1.0 - static_cast<double>(epoch) / numEpochs);
-        double totalLoss = 0.0;
-
-        for (size_t i = 0; i < words.size(); ++i) {
-            auto it = wordToIndex.find(words[i]);
-            if (it == wordToIndex.end()) continue;
-            size_t currentWordIdx = it->second;
-            double freq = wordFrequencies.at(words[i]);
-            if (uniform(rng) > getSubsamplingProb(freq, subsampleThreshold)) continue;
-
-            vector<double> &embedVec = embeddingMatrix[currentWordIdx];
-
-            for (int j = -windowSize; j <= windowSize; ++j) {
-                if (j == 0) continue;
-                size_t ctxPos = i + j;
-                if (ctxPos >= words.size()) continue;
-
-                auto tgtIt = wordToIndex.find(words[ctxPos]);
-                if (tgtIt == wordToIndex.end()) continue;
-                size_t targetIdx = tgtIt->second;
-                vector<double> ctxVec = getContextVector(contextMatrix, targetIdx);
-
-                int dim = embedVec.size();
-                double *d_A, *d_B, *d_C;
-                cudaMalloc(&d_A, dim * sizeof(double));
-                cudaMalloc(&d_B, dim * sizeof(double));
-                cudaMalloc(&d_C, dim * sizeof(double));
-
-                cudaMemcpy(d_A, embedVec.data(), dim * sizeof(double), cudaMemcpyHostToDevice);
-                cudaMemcpy(d_B, ctxVec.data(), dim * sizeof(double), cudaMemcpyHostToDevice);
-
-                dotProductKernel<<<(dim + 255)/256, 256>>>(d_A, d_B, d_C, dim);
-
-                vector<double> result(dim);
-                cudaMemcpy(result.data(), d_C, dim * sizeof(double), cudaMemcpyDeviceToHost);
-
-                double dotProd = 0.0;
-                for (double v : result) dotProd += v;
-
-                double sigPos = sigmoid(dotProd);
-                double gradPos = sigPos - 1.0;
-                totalLoss += -log(sigPos + 1e-10);
-
-                for (size_t d = 0; d < dim; ++d) {
-                    contextMatrix[targetIdx][d] -= learningRate * gradPos * embedVec[d];
-                    embeddingMatrix[currentWordIdx][d] -= learningRate * gradPos * ctxVec[d];
-                }
-
-                for (int neg = 0; neg < negSamples; ++neg) {
-                    size_t negIdx = negSampler(rng);
-                    if (negIdx == targetIdx) continue;
-                    vector<double> negVec = getContextVector(contextMatrix, negIdx);
-
-                    cudaMemcpy(d_B, negVec.data(), dim * sizeof(double), cudaMemcpyHostToDevice);
-                    dotProductKernel<<<(dim + 255)/256, 256>>>(d_A, d_B, d_C, dim);
-                    cudaMemcpy(result.data(), d_C, dim * sizeof(double), cudaMemcpyDeviceToHost);
-
-                    double dotNeg = 0.0;
-                    for (double v : result) dotNeg += v;
-                    double sigNeg = sigmoid(dotNeg);
-                    double gradNeg = sigNeg;
-                    totalLoss += -log(1.0 - sigNeg + 1e-10);
-
-                    for (size_t d = 0; d < dim; ++d) {
-                        contextMatrix[negIdx][d] -= learningRate * gradNeg * embedVec[d];
-                        embeddingMatrix[currentWordIdx][d] -= learningRate * gradNeg * negVec[d];
-                    }
-                }
-
-                cudaFree(d_A); cudaFree(d_B); cudaFree(d_C);
-            }
-        }
-
-        cout << "Epoch " << epoch << ", Learning Rate: " << learningRate
-             << ", Avg Loss: " << totalLoss / words.size() << endl;
-
-        if (epoch > 10 && abs(prevLoss - totalLoss) < 0.01 * prevLoss) {
-            cout << "Early stopping at epoch " << epoch << endl;
-            break;
-        }
-        prevLoss = totalLoss;
-    }
 }
 
 // Interactive prediction loop
@@ -293,16 +479,14 @@ void interactivePrediction(
             continue;
         }
         size_t wordIndex = wordIt->second;
-const vector<double> &wordEmbedding = embeddingMatrix[wordIndex];
+        const vector<double> &wordEmbedding = embeddingMatrix[wordIndex];
 
-vector<pair<string, double>> similarities;
-for (size_t i = 0; i < vocabulary.size(); i++)
-{
-    const vector<double> &contextVector = contextMatrix[i];
-    double similarity = cosineSimilarity(wordEmbedding, contextVector);
-    similarities.emplace_back(vocabulary[i], similarity);
-}
-
+        vector<pair<string, double>> similarities;
+        for (size_t i = 0; i < vocabulary.size(); i++)
+        {
+            double similarity = cosineSimilarity(wordEmbedding, contextMatrix[i]);
+            similarities.emplace_back(vocabulary[i], similarity);
+        }
 
         // Sort by similarity in descending order
         sort(similarities.begin(), similarities.end(),
@@ -322,13 +506,15 @@ for (size_t i = 0; i < vocabulary.size(); i++)
 
 int main()
 {
-    // Hyperparameters
+    // Arrays of hyperparameters to test
+    const vector<int> WINDOW_SIZES = {2};
+    const vector<int> EMBEDDING_DIMS = {50, 100};
+    
+    // Fixed hyperparameters
     const int NUM_EPOCHS = 100;
     const double INITIAL_LEARNING_RATE = 0.05;
-    const int WINDOW_SIZE = 2;
     const int NEG_SAMPLES = 5;
     const double SUBSAMPLE_THRESHOLD = 1e-5;
-    const int EMBEDDING_DIM = 100;
 
     // Read corpus from a text file
     vector<string> words;
@@ -360,92 +546,185 @@ int main()
     // Compute word frequencies for subsampling
     unordered_map<string, double> wordFrequencies = computeWordFrequencies(words);
 
-    // Initialize embedding and context matrices
-    cout << "Initializing matrices with embedding dimension: " << EMBEDDING_DIM << endl;
-    
-    // Use Xavier/Glorot initialization for better training
-    double xavier_limit = sqrt(6.0 / (vocabulary.size() + EMBEDDING_DIM));
-    
-    vector<vector<double>> embeddingMatrix(vocabulary.size(), vector<double>(EMBEDDING_DIM));
-vector<vector<double>> contextMatrix(vocabulary.size(), vector<double>(EMBEDDING_DIM));
-    
-    // Initialize with Xavier/Glorot initialization
-    mt19937 rng(time(nullptr));
-    uniform_real_distribution<double> uniform(-xavier_limit, xavier_limit);
-    
-    for (size_t i = 0; i < vocabulary.size(); i++) {
-        for (size_t j = 0; j < EMBEDDING_DIM; j++) {
-            embeddingMatrix[i][j] = uniform(rng);
-        }
-    }
-    
-    for (size_t i = 0; i < EMBEDDING_DIM; i++) {
-        for (size_t j = 0; j < vocabulary.size(); j++) {
-            contextMatrix[i][j] = uniform(rng);
-        }
-    }
-    
-    // Save initial matrices (optional)
-    ofstream embOut("embedding_matrix.txt");
-    for (const auto &row : embeddingMatrix) {
-        for (size_t j = 0; j < row.size(); j++) {
-            embOut << row[j] << (j + 1 < row.size() ? " " : "");
-        }
-        embOut << endl;
-    }
-    embOut.close();
-    
-    ofstream ctxOut("context_matrix.txt");
-    for (const auto &row : contextMatrix) {
-        for (size_t j = 0; j < row.size(); j++) {
-            ctxOut << row[j] << (j + 1 < row.size() ? " " : "");
-        }
-        ctxOut << endl;
-    }
-    ctxOut.close();
+    // Run all combinations
+    for (int window_size : WINDOW_SIZES) {
+        for (int embedding_dim : EMBEDDING_DIMS) {
+            cout << "\n=======================================================" << endl;
+            cout << "TRAINING WITH WINDOW SIZE: " << window_size 
+                 << " AND EMBEDDING DIM: " << embedding_dim << endl;
+            cout << "=======================================================" << endl;
+            
+            // Initialize embedding and context matrices
+            cout << "Initializing matrices with embedding dimension: " << embedding_dim << endl;
+            
+            // Use Xavier/Glorot initialization for better training
+            double xavier_limit = sqrt(6.0 / (vocabulary.size() + embedding_dim));
+            
+            vector<vector<double>> embeddingMatrix(vocabulary.size(), vector<double>(embedding_dim));
+            vector<vector<double>> contextMatrix(vocabulary.size(), vector<double>(embedding_dim));
+            
+            // Initialize with Xavier/Glorot initialization
+            mt19937 rng(time(nullptr));
+            uniform_real_distribution<double> uniform(-xavier_limit, xavier_limit);
+            
+            for (size_t i = 0; i < vocabulary.size(); i++) {
+                for (size_t j = 0; j < embedding_dim; j++) {
+                    embeddingMatrix[i][j] = uniform(rng);
+                    contextMatrix[i][j] = uniform(rng);
+                }
+            }
+            
+            // Create configuration string for file naming
+            string config = "_w" + to_string(window_size) + "_d" + to_string(embedding_dim);
+            
+            // Save initial matrices
+            ofstream embOut("embedding_matrix_initial" + config + ".txt");
+            for (const auto &row : embeddingMatrix) {
+                for (size_t j = 0; j < row.size(); j++) {
+                    embOut << row[j] << (j + 1 < row.size() ? " " : "");
+                }
+                embOut << endl;
+            }
+            embOut.close();
+            
+            ofstream ctxOut("context_matrix_initial" + config + ".txt");
+            for (const auto &row : contextMatrix) {
+                for (size_t j = 0; j < row.size(); j++) {
+                    ctxOut << row[j] << (j + 1 < row.size() ? " " : "");
+                }
+                ctxOut << endl;
+            }
+            ctxOut.close();
 
-    cout << "Training Word2Vec model with:" << endl;
-    cout << "- Window size: " << WINDOW_SIZE << endl;
-    cout << "- Negative samples: " << NEG_SAMPLES << endl;
-    cout << "- Subsampling threshold: " << SUBSAMPLE_THRESHOLD << endl;
-    cout << "- Initial learning rate: " << INITIAL_LEARNING_RATE << endl;
-    cout << "total words : " << vocabulary.size() <<endl;
+            cout << "Training Word2Vec model with:" << endl;
+            cout << "- Window size: " << window_size << endl;
+            cout << "- Embedding dimension: " << embedding_dim << endl;
+            cout << "- Negative samples: " << NEG_SAMPLES << endl;
+            cout << "- Subsampling threshold: " << SUBSAMPLE_THRESHOLD << endl;
+            cout << "- Initial learning rate: " << INITIAL_LEARNING_RATE << endl;
+            cout << "- Vocabulary size: " << vocabulary.size() << endl;
 
-    auto start_time = chrono::high_resolution_clock::now();
-    
-    // Train model with all features
-    trainModel(embeddingMatrix, contextMatrix, words, vocabulary, wordToIndex, 
-               wordFrequencies, NUM_EPOCHS, INITIAL_LEARNING_RATE, 
-               WINDOW_SIZE, NEG_SAMPLES, SUBSAMPLE_THRESHOLD);
+            auto start_time = chrono::high_resolution_clock::now();
+            
+            // Train model with all features
+            trainModel(embeddingMatrix, contextMatrix, words, vocabulary, wordToIndex, 
+                      wordFrequencies, NUM_EPOCHS, INITIAL_LEARNING_RATE, 
+                      window_size, NEG_SAMPLES, SUBSAMPLE_THRESHOLD);
 
-    auto end_time = chrono::high_resolution_clock::now();
-    auto duration = chrono::duration_cast<chrono::seconds>(end_time - start_time);
+            auto end_time = chrono::high_resolution_clock::now();
+            auto duration = chrono::duration_cast<chrono::seconds>(end_time - start_time);
 
-    cout << "Training completed in " << duration.count() << " seconds (" 
-         << duration.count()/60.0 << " minutes)" << endl;              
-    // Save final matrices
-    ofstream embOutFinal("embedding_matrix.txt");
-    for (const auto &row : embeddingMatrix) {
-        for (size_t j = 0; j < row.size(); j++) {
-            embOutFinal << row[j] << (j + 1 < row.size() ? " " : "");
+            cout << "Training completed in " << duration.count() << " seconds (" 
+                 << duration.count()/60.0 << " minutes)" << endl;
+                 
+            // Save final matrices
+            ofstream embOutFinal("embedding_matrix_final" + config + ".txt");
+            for (const auto &row : embeddingMatrix) {
+                for (size_t j = 0; j < row.size(); j++) {
+                    embOutFinal << row[j] << (j + 1 < row.size() ? " " : "");
+                }
+                embOutFinal << endl;
+            }
+            embOutFinal.close();
+            
+            ofstream ctxOutFinal("context_matrix_final" + config + ".txt");
+            for (const auto &row : contextMatrix) {
+                for (size_t j = 0; j < row.size(); j++) {
+                    ctxOutFinal << row[j] << (j + 1 < row.size() ? " " : "");
+                }
+                ctxOutFinal << endl;
+            }
+            ctxOutFinal.close();
+            
+            cout << "Matrices saved with configuration: " << config << endl;
+            
+            // Test a few example words
+            cout << "\nTesting a few example words:" << endl;
+            vector<string> testWords = {"the", "and", "of"};
+            
+            for (const string& word : testWords) {
+                auto wordIt = wordToIndex.find(word);
+                if (wordIt != wordToIndex.end()) {
+                    size_t wordIndex = wordIt->second;
+                    
+                    vector<pair<string, double>> similarities;
+                    for (size_t i = 0; i < vocabulary.size(); i++) {
+                        double similarity = cosineSimilarity(embeddingMatrix[wordIndex], contextMatrix[i]);
+                        similarities.emplace_back(vocabulary[i], similarity);
+                    }
+                    
+                    sort(similarities.begin(), similarities.end(),
+                         [](const pair<string, double> &a, const pair<string, double> &b) {
+                             return a.second > b.second;
+                         });
+                    
+                    cout << "Top 5 similar words to '" << word << "':" << endl;
+                    for (size_t i = 0; i < min(size_t(5), similarities.size()); i++) {
+                        cout << similarities[i].first << ": " << similarities[i].second * 100.0 << "%" << endl;
+                    }
+                    cout << "------------------------" << endl;
+                }
+            }
         }
-        embOutFinal << endl;
     }
-    embOutFinal.close();
-    
-    ofstream ctxOutFinal("context_matrix.txt");
-    for (const auto &row : contextMatrix) {
-        for (size_t j = 0; j < row.size(); j++) {
-            ctxOutFinal << row[j] << (j + 1 < row.size() ? " " : "");
-        }
-        ctxOutFinal << endl;
-    }
-    ctxOutFinal.close();
-    
-    cout << "Training complete. Embedding and context matrices saved." << endl;
 
-    // Interactive prediction
-    interactivePrediction(embeddingMatrix, contextMatrix, vocabulary, wordToIndex);
+    // Ask user which configuration to use for interactive prediction
+    cout << "\nWhich configuration would you like to use for interactive prediction?" << endl;
+    
+    int selectedWindowSize;
+    int selectedEmbeddingDim;
+    
+    cout << "Enter window size (";
+    for (size_t i = 0; i < WINDOW_SIZES.size(); i++) {
+        cout << WINDOW_SIZES[i] << (i < WINDOW_SIZES.size()-1 ? ", " : "");
+    }
+    cout << "): ";
+    cin >> selectedWindowSize;
+    
+    cout << "Enter embedding dimension (";
+    for (size_t i = 0; i < EMBEDDING_DIMS.size(); i++) {
+        cout << EMBEDDING_DIMS[i] << (i < EMBEDDING_DIMS.size()-1 ? ", " : "");
+    }
+    cout << "): ";
+    cin >> selectedEmbeddingDim;
+    
+    // Load matrices for selected configuration
+    string selectedConfig = "_w" + to_string(selectedWindowSize) + "_d" + to_string(selectedEmbeddingDim);
+    cout << "Loading configuration: " << selectedConfig << endl;
+    
+    vector<vector<double>> selectedEmbeddingMatrix(vocabulary.size(), vector<double>(selectedEmbeddingDim));
+    vector<vector<double>> selectedContextMatrix(vocabulary.size(), vector<double>(selectedEmbeddingDim));
+    
+    // Load embedding matrix
+    ifstream embIn("embedding_matrix_final" + selectedConfig + ".txt");
+    if (embIn.is_open()) {
+        for (size_t i = 0; i < vocabulary.size(); i++) {
+            for (size_t j = 0; j < selectedEmbeddingDim; j++) {
+                embIn >> selectedEmbeddingMatrix[i][j];
+            }
+        }
+        embIn.close();
+    } else {
+        cerr << "Error loading embedding matrix" << endl;
+        return 1;
+    }
+    
+    // Load context matrix
+    ifstream ctxIn("context_matrix_final" + selectedConfig + ".txt");
+    if (ctxIn.is_open()) {
+        for (size_t i = 0; i < vocabulary.size(); i++) {
+            for (size_t j = 0; j < selectedEmbeddingDim; j++) {
+                ctxIn >> selectedContextMatrix[i][j];
+            }
+        }
+        ctxIn.close();
+    } else {
+        cerr << "Error loading context matrix" << endl;
+        return 1;
+    }
+    
+    // Run interactive prediction with selected configuration
+    interactivePrediction(selectedEmbeddingMatrix, selectedContextMatrix, vocabulary, wordToIndex);
 
     return 0;
 }
