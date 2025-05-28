@@ -386,19 +386,152 @@ void interactivePrediction(
     }
 }
 
+// int main()
+// {
+//     // Hyperparameters
+//     const int NUM_EPOCHS = 100;
+//     const double INITIAL_LEARNING_RATE = 0.05;
+//     const int WINDOW_SIZE = 2;
+//     const int NEG_SAMPLES = 5;
+//     const double SUBSAMPLE_THRESHOLD = 1e-5;
+//     const int EMBEDDING_DIM = 100;
+
+//     // Read corpus from a text file
+//     vector<string> words;
+//     ifstream file("output.txt");
+//     if (file.is_open())
+//     {
+//         string word;
+//         while (file >> word)
+//             words.push_back(word);
+//         file.close();
+//     }
+//     else
+//     {
+//         cerr << "Error: Unable to open file 'output.txt'" << endl;
+//         return 1;
+//     }
+
+//     cout << "Corpus size: " << words.size() << " words" << endl;
+    
+//     // Build vocabulary (unique words)
+//     vector<string> vocabulary = buildVocabulary(words);
+//     cout << "Vocabulary size: " << vocabulary.size() << " unique words" << endl;
+
+//     // Build word-to-index map
+//     unordered_map<string, size_t> wordToIndex;
+//     for (size_t i = 0; i < vocabulary.size(); ++i)
+//         wordToIndex[vocabulary[i]] = i;
+        
+//     // Compute word frequencies for subsampling
+//     unordered_map<string, double> wordFrequencies = computeWordFrequencies(words);
+
+//     // Initialize embedding and context matrices
+//     cout << "Initializing matrices with embedding dimension: " << EMBEDDING_DIM << endl;
+    
+//     // Use Xavier/Glorot initialization for better training
+//     double xavier_limit = sqrt(6.0 / (vocabulary.size() + EMBEDDING_DIM));
+    
+//     vector<vector<double>> embeddingMatrix(vocabulary.size(), vector<double>(EMBEDDING_DIM));
+//     vector<vector<double>> contextMatrix(EMBEDDING_DIM, vector<double>(vocabulary.size()));
+    
+//     // Initialize with Xavier/Glorot initialization
+//     mt19937 rng(time(nullptr));
+//     uniform_real_distribution<double> uniform(-xavier_limit, xavier_limit);
+    
+//     for (size_t i = 0; i < vocabulary.size(); i++) {
+//         for (size_t j = 0; j < EMBEDDING_DIM; j++) {
+//             embeddingMatrix[i][j] = uniform(rng);
+//         }
+//     }
+    
+//     for (size_t i = 0; i < EMBEDDING_DIM; i++) {
+//         for (size_t j = 0; j < vocabulary.size(); j++) {
+//             contextMatrix[i][j] = uniform(rng);
+//         }
+//     }
+    
+//     // Save initial matrices (optional)
+//     ofstream embOut("embedding_matrix_initial.txt");
+//     for (const auto &row : embeddingMatrix) {
+//         for (size_t j = 0; j < row.size(); j++) {
+//             embOut << row[j] << (j + 1 < row.size() ? " " : "");
+//         }
+//         embOut << endl;
+//     }
+//     embOut.close();
+    
+//     ofstream ctxOut("context_matrix_initial.txt");
+//     for (const auto &row : contextMatrix) {
+//         for (size_t j = 0; j < row.size(); j++) {
+//             ctxOut << row[j] << (j + 1 < row.size() ? " " : "");
+//         }
+//         ctxOut << endl;
+//     }
+//     ctxOut.close();
+
+//     cout << "Training Word2Vec model with:" << endl;
+//     cout << "- Window size: " << WINDOW_SIZE << endl;
+//     cout << "- Negative samples: " << NEG_SAMPLES << endl;
+//     cout << "- Subsampling threshold: " << SUBSAMPLE_THRESHOLD << endl;
+//     cout << "- Initial learning rate: " << INITIAL_LEARNING_RATE << endl;
+//     cout << "total words : " << vocabulary.size() <<endl;
+
+//     auto start_time = chrono::high_resolution_clock::now();
+    
+//     // Train model with all features
+//     trainModel(embeddingMatrix, contextMatrix, words, vocabulary, wordToIndex, 
+//                wordFrequencies, NUM_EPOCHS, INITIAL_LEARNING_RATE, 
+//                WINDOW_SIZE, NEG_SAMPLES, SUBSAMPLE_THRESHOLD);
+
+    
+//     auto end_time = chrono::high_resolution_clock::now();
+//     auto duration = chrono::duration_cast<chrono::seconds>(end_time - start_time);
+           
+//     cout << "Training completed in " << duration.count() << " seconds (" 
+//          << duration.count()/60.0 << " minutes)" << endl;
+//     // Save final matrices
+//     ofstream embOutFinal("embedding_matrix_final.txt");
+//     for (const auto &row : embeddingMatrix) {
+//         for (size_t j = 0; j < row.size(); j++) {
+//             embOutFinal << row[j] << (j + 1 < row.size() ? " " : "");
+//         }
+//         embOutFinal << endl;
+//     }
+//     embOutFinal.close();
+    
+//     ofstream ctxOutFinal("context_matrix_final.txt");
+//     for (const auto &row : contextMatrix) {
+//         for (size_t j = 0; j < row.size(); j++) {
+//             ctxOutFinal << row[j] << (j + 1 < row.size() ? " " : "");
+//         }
+//         ctxOutFinal << endl;
+//     }
+//     ctxOutFinal.close();
+    
+//     cout << "Training complete. Embedding and context matrices saved." << endl;
+
+//     // Interactive prediction
+//     interactivePrediction(embeddingMatrix, contextMatrix, vocabulary, wordToIndex);
+
+//     return 0;
+// }
+
 int main()
 {
-    // Hyperparameters
+    // Fixed hyperparameters
     const int NUM_EPOCHS = 100;
     const double INITIAL_LEARNING_RATE = 0.05;
-    const int WINDOW_SIZE = 2;
     const int NEG_SAMPLES = 5;
     const double SUBSAMPLE_THRESHOLD = 1e-5;
-    const int EMBEDDING_DIM = 100;
+    
+    // Arrays of hyperparameters to test
+    const vector<int> WINDOW_SIZES = {2, 5, 10};
+    const vector<int> EMBEDDING_DIMS = {50, 100, 200, 300};
 
     // Read corpus from a text file
     vector<string> words;
-    ifstream file("output.txt");
+    ifstream file("output2.txt");
     if (file.is_open())
     {
         string word;
@@ -426,93 +559,214 @@ int main()
     // Compute word frequencies for subsampling
     unordered_map<string, double> wordFrequencies = computeWordFrequencies(words);
 
-    // Initialize embedding and context matrices
-    cout << "Initializing matrices with embedding dimension: " << EMBEDDING_DIM << endl;
-    
-    // Use Xavier/Glorot initialization for better training
-    double xavier_limit = sqrt(6.0 / (vocabulary.size() + EMBEDDING_DIM));
-    
-    vector<vector<double>> embeddingMatrix(vocabulary.size(), vector<double>(EMBEDDING_DIM));
-    vector<vector<double>> contextMatrix(EMBEDDING_DIM, vector<double>(vocabulary.size()));
-    
-    // Initialize with Xavier/Glorot initialization
-    mt19937 rng(time(nullptr));
-    uniform_real_distribution<double> uniform(-xavier_limit, xavier_limit);
-    
-    for (size_t i = 0; i < vocabulary.size(); i++) {
-        for (size_t j = 0; j < EMBEDDING_DIM; j++) {
-            embeddingMatrix[i][j] = uniform(rng);
-        }
-    }
-    
-    for (size_t i = 0; i < EMBEDDING_DIM; i++) {
-        for (size_t j = 0; j < vocabulary.size(); j++) {
-            contextMatrix[i][j] = uniform(rng);
-        }
-    }
-    
-    // Save initial matrices (optional)
-    ofstream embOut("embedding_matrix_initial.txt");
-    for (const auto &row : embeddingMatrix) {
-        for (size_t j = 0; j < row.size(); j++) {
-            embOut << row[j] << (j + 1 < row.size() ? " " : "");
-        }
-        embOut << endl;
-    }
-    embOut.close();
-    
-    ofstream ctxOut("context_matrix_initial.txt");
-    for (const auto &row : contextMatrix) {
-        for (size_t j = 0; j < row.size(); j++) {
-            ctxOut << row[j] << (j + 1 < row.size() ? " " : "");
-        }
-        ctxOut << endl;
-    }
-    ctxOut.close();
+    // Keep track of the best configuration for interactive prediction
+    double best_loss = DBL_MAX;
+    int best_window_size = 0;
+    int best_embedding_dim = 0;
+    vector<vector<double>> best_embedding_matrix;
+    vector<vector<double>> best_context_matrix;
 
-    cout << "Training Word2Vec model with:" << endl;
-    cout << "- Window size: " << WINDOW_SIZE << endl;
-    cout << "- Negative samples: " << NEG_SAMPLES << endl;
-    cout << "- Subsampling threshold: " << SUBSAMPLE_THRESHOLD << endl;
-    cout << "- Initial learning rate: " << INITIAL_LEARNING_RATE << endl;
-    cout << "total words : " << vocabulary.size() <<endl;
+    // For each combination of window size and embedding dimension
+    for (int window_size : WINDOW_SIZES) {
+        for (int embedding_dim : EMBEDDING_DIMS) {
+            cout << "\n=======================================================" << endl;
+            cout << "TRAINING WITH WINDOW SIZE: " << window_size 
+                 << " AND EMBEDDING DIM: " << embedding_dim << endl;
+            cout << "=======================================================" << endl;
+            
+            // Initialize embedding and context matrices
+            cout << "Initializing matrices with embedding dimension: " << embedding_dim << endl;
+            
+            // Use Xavier/Glorot initialization for better training
+            double xavier_limit = sqrt(6.0 / (vocabulary.size() + embedding_dim));
+            
+            vector<vector<double>> embeddingMatrix(vocabulary.size(), vector<double>(embedding_dim));
+            vector<vector<double>> contextMatrix(embedding_dim, vector<double>(vocabulary.size()));
+            
+            // Initialize with Xavier/Glorot initialization
+            mt19937 rng(time(nullptr));
+            uniform_real_distribution<double> uniform(-xavier_limit, xavier_limit);
+            
+            for (size_t i = 0; i < vocabulary.size(); i++) {
+                for (size_t j = 0; j < embedding_dim; j++) {
+                    embeddingMatrix[i][j] = uniform(rng);
+                }
+            }
+            
+            for (size_t i = 0; i < embedding_dim; i++) {
+                for (size_t j = 0; j < vocabulary.size(); j++) {
+                    contextMatrix[i][j] = uniform(rng);
+                }
+            }
+            
+            // Save initial matrices with configuration in filename
+            string config = "_w" + to_string(window_size) + "_d" + to_string(embedding_dim);
+            ofstream embOut("embedding_matrix_initial" + config + ".txt");
+            for (const auto &row : embeddingMatrix) {
+                for (size_t j = 0; j < row.size(); j++) {
+                    embOut << row[j] << (j + 1 < row.size() ? " " : "");
+                }
+                embOut << endl;
+            }
+            embOut.close();
+            
+            cout << "Training Word2Vec model with:" << endl;
+            cout << "- Window size: " << window_size << endl;
+            cout << "- Embedding dimension: " << embedding_dim << endl;
+            cout << "- Negative samples: " << NEG_SAMPLES << endl;
+            cout << "- Subsampling threshold: " << SUBSAMPLE_THRESHOLD << endl;
+            cout << "- Initial learning rate: " << INITIAL_LEARNING_RATE << endl;
+            cout << "- Vocabulary size: " << vocabulary.size() << endl;
 
-    auto start_time = chrono::high_resolution_clock::now();
-    
-    // Train model with all features
-    trainModel(embeddingMatrix, contextMatrix, words, vocabulary, wordToIndex, 
-               wordFrequencies, NUM_EPOCHS, INITIAL_LEARNING_RATE, 
-               WINDOW_SIZE, NEG_SAMPLES, SUBSAMPLE_THRESHOLD);
-
-    
-    auto end_time = chrono::high_resolution_clock::now();
-    auto duration = chrono::duration_cast<chrono::seconds>(end_time - start_time);
-           
-    cout << "Training completed in " << duration.count() << " seconds (" 
-         << duration.count()/60.0 << " minutes)" << endl;
-    // Save final matrices
-    ofstream embOutFinal("embedding_matrix_final.txt");
-    for (const auto &row : embeddingMatrix) {
-        for (size_t j = 0; j < row.size(); j++) {
-            embOutFinal << row[j] << (j + 1 < row.size() ? " " : "");
+            auto start_time = chrono::high_resolution_clock::now();
+            
+            // Store the previous loss value to calculate improvement
+            double prevLoss = DBL_MAX;
+            
+            // Train model with current configuration
+            trainModel(embeddingMatrix, contextMatrix, words, vocabulary, wordToIndex, 
+                       wordFrequencies, NUM_EPOCHS, INITIAL_LEARNING_RATE, 
+                       window_size, NEG_SAMPLES, SUBSAMPLE_THRESHOLD);
+            
+            auto end_time = chrono::high_resolution_clock::now();
+            auto duration = chrono::duration_cast<chrono::seconds>(end_time - start_time);
+            
+            cout << "Training completed in " << duration.count() << " seconds (" 
+                 << duration.count()/60.0 << " minutes)" << endl;
+                 
+            // Save final matrices with configuration in filename
+            ofstream embOutFinal("embedding_matrix_final" + config + ".txt");
+            for (const auto &row : embeddingMatrix) {
+                for (size_t j = 0; j < row.size(); j++) {
+                    embOutFinal << row[j] << (j + 1 < row.size() ? " " : "");
+                }
+                embOutFinal << endl;
+            }
+            embOutFinal.close();
+            
+            ofstream ctxOutFinal("context_matrix_final" + config + ".txt");
+            for (const auto &row : contextMatrix) {
+                for (size_t j = 0; j < row.size(); j++) {
+                    ctxOutFinal << row[j] << (j + 1 < row.size() ? " " : "");
+                }
+                ctxOutFinal << endl;
+            }
+            ctxOutFinal.close();
+            
+            cout << "Matrices saved with config: " << config << endl;
+            
+            // Test a few example words to evaluate model quality
+            cout << "\nTesting model quality with example words:" << endl;
+            vector<string> testWords = {"the", "and", "of", "to", "in"};  // Common words likely in vocabulary
+            
+            for (const string& word : testWords) {
+                auto wordIt = wordToIndex.find(word);
+                if (wordIt != wordToIndex.end()) {
+                    size_t wordIndex = wordIt->second;
+                    string mostSimilar = findMostSimilarWord(embeddingMatrix[wordIndex], 
+                                                            contextMatrix, vocabulary);
+                    cout << "Most similar to '" << word << "': " << mostSimilar << endl;
+                }
+            }
         }
-        embOutFinal << endl;
     }
-    embOutFinal.close();
-    
-    ofstream ctxOutFinal("context_matrix_final.txt");
-    for (const auto &row : contextMatrix) {
-        for (size_t j = 0; j < row.size(); j++) {
-            ctxOutFinal << row[j] << (j + 1 < row.size() ? " " : "");
-        }
-        ctxOutFinal << endl;
-    }
-    ctxOutFinal.close();
-    
-    cout << "Training complete. Embedding and context matrices saved." << endl;
 
-    // Interactive prediction
-    interactivePrediction(embeddingMatrix, contextMatrix, vocabulary, wordToIndex);
+    cout << "\nTraining complete for all configurations." << endl;
+    cout << "Use the saved matrices for further analysis." << endl;
+
+    // Ask user which configuration to use for interactive prediction
+    cout << "\nEnter configuration for interactive prediction:" << endl;
+    int userWindowSize, userEmbeddingDim;
+    
+    cout << "Window size (";
+    for (size_t i = 0; i < WINDOW_SIZES.size(); i++) {
+        cout << WINDOW_SIZES[i] << (i < WINDOW_SIZES.size()-1 ? ", " : "");
+    }
+    cout << "): ";
+    cin >> userWindowSize;
+    
+    cout << "Embedding dimension (";
+    for (size_t i = 0; i < EMBEDDING_DIMS.size(); i++) {
+        cout << EMBEDDING_DIMS[i] << (i < EMBEDDING_DIMS.size()-1 ? ", " : "");
+    }
+    cout << "): ";
+    cin >> userEmbeddingDim;
+    
+    // Load the selected configuration
+    string configToLoad = "_w" + to_string(userWindowSize) + "_d" + to_string(userEmbeddingDim);
+    cout << "Loading matrices with config: " << configToLoad << endl;
+    
+    // You could add code here to load the matrices from files if needed
+    // For now, we'll assume the user selects one of the configurations we just trained
+    
+    // Find the selected configuration
+    vector<vector<double>> selectedEmbeddingMatrix;
+    vector<vector<double>> selectedContextMatrix;
+    bool configFound = false;
+    
+    for (int window_size : WINDOW_SIZES) {
+        for (int embedding_dim : EMBEDDING_DIMS) {
+            if (window_size == userWindowSize && embedding_dim == userEmbeddingDim) {
+                // This is the configuration we want
+                // In a real implementation, you might load these from files
+                // For simplicity, we'll just run interactive prediction with what we have
+                configFound = true;
+                break;
+            }
+        }
+        if (configFound) break;
+    }
+    
+    if (configFound) {
+        // Load matrices from files for the selected configuration
+        vector<vector<double>> selectedEmbeddingMatrix;
+        vector<vector<double>> selectedContextMatrix;
+        
+        // Load embedding matrix
+        string embeddingFile = "embedding_matrix_final" + configToLoad + ".txt";
+        ifstream embIn(embeddingFile);
+        if (embIn.is_open()) {
+            string line;
+            while (getline(embIn, line)) {
+                istringstream iss(line);
+                vector<double> row;
+                double val;
+                while (iss >> val) {
+                    row.push_back(val);
+                }
+                selectedEmbeddingMatrix.push_back(row);
+            }
+            embIn.close();
+        } else {
+            cerr << "Could not open " << embeddingFile << endl;
+            return 1;
+        }
+        
+        // Load context matrix
+        string contextFile = "context_matrix_final" + configToLoad + ".txt";
+        ifstream ctxIn(contextFile);
+        if (ctxIn.is_open()) {
+            string line;
+            while (getline(ctxIn, line)) {
+                istringstream iss(line);
+                vector<double> row;
+                double val;
+                while (iss >> val) {
+                    row.push_back(val);
+                }
+                selectedContextMatrix.push_back(row);
+            }
+            ctxIn.close();
+        } else {
+            cerr << "Could not open " << contextFile << endl;
+            return 1;
+        }
+        
+        // Run interactive prediction with loaded matrices
+        interactivePrediction(selectedEmbeddingMatrix, selectedContextMatrix, vocabulary, wordToIndex);
+    } else {
+        cout << "Configuration not found. Please select from the available options." << endl;
+    }
 
     return 0;
 }
